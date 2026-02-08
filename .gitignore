@@ -1,0 +1,19 @@
+# Rust / Cargo
+target/
+**/*.rs.bk
+
+# Editor/OS junk
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+
+# Env files
+.env
+.env.*
+
+# Logs
+*.log
+
