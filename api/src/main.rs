@@ -1,9 +1,6 @@
-mod app;
-mod payment_intents;
-mod state;
-
 use sqlx::PgPool;
-use state::AppState;
+
+use api::state::AppState;
 
 #[tokio::main]
 async fn main() {
@@ -18,7 +15,7 @@ async fn main() {
 
     let state = AppState { db };
 
-    let app = app::build_app(state);
+    let app = api::app::build_app(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
         .await
