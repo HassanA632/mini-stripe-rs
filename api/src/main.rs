@@ -1,5 +1,6 @@
 use axum::{
     Json, Router,
+    extract::Path,
     extract::State,
     http::StatusCode,
     routing::{get, post},
@@ -72,6 +73,36 @@ async fn create_payment_intent(
     ))
 }
 
+async fn get_payment_intent(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<PaymentIntentResponse>, (StatusCode, String)> {
+    let row = sqlx::query!(
+        r#"
+        SELECT id, amount, currency, status
+        FROM payment_intents
+        WHERE id = $1
+        "#,
+        id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+
+    match row {
+        Some(pi) => Ok(Json(PaymentIntentResponse {
+            id: pi.id,
+            amount: pi.amount,
+            currency: pi.currency,
+            status: pi.status,
+        })),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            "payment_intent not found".to_string(),
+        )),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
@@ -87,6 +118,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/payment_intents", post(create_payment_intent))
+        .route("/v1/payment_intents/:id", get(get_payment_intent))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
