@@ -22,15 +22,22 @@ pub struct PaymentIntentResponse {
     status: String,
 }
 
+fn validate_create_payment_intent(req: &CreatePaymentIntentRequest) -> Result<(), &'static str> {
+    if req.amount <= 0 {
+        return Err("amount must be > 0");
+    }
+    if req.currency.trim().is_empty() {
+        return Err("currency is required");
+    }
+    Ok(())
+}
+
 pub async fn create_payment_intent(
     State(state): State<AppState>,
     Json(req): Json<CreatePaymentIntentRequest>,
 ) -> Result<(StatusCode, Json<PaymentIntentResponse>), (StatusCode, String)> {
-    if req.amount <= 0 {
-        return Err((StatusCode::BAD_REQUEST, "amount must be > 0".to_string()));
-    }
-    if req.currency.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "currency is required".to_string()));
+    if let Err(msg) = validate_create_payment_intent(&req) {
+        return Err((StatusCode::BAD_REQUEST, msg.to_string()));
     }
 
     let id = Uuid::new_v4();
@@ -88,5 +95,42 @@ pub async fn get_payment_intent(
             StatusCode::NOT_FOUND,
             "payment_intent not found".to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_rejects_non_positive_amount() {
+        let req = CreatePaymentIntentRequest {
+            amount: 0,
+            currency: "gbp".to_string(),
+        };
+
+        let err = validate_create_payment_intent(&req).unwrap_err();
+        assert_eq!(err, "amount must be > 0");
+    }
+
+    #[test]
+    fn validate_rejects_empty_currency() {
+        let req = CreatePaymentIntentRequest {
+            amount: 2500,
+            currency: "   ".to_string(),
+        };
+
+        let err = validate_create_payment_intent(&req).unwrap_err();
+        assert_eq!(err, "currency is required");
+    }
+
+    #[test]
+    fn validate_accepts_good_input() {
+        let req = CreatePaymentIntentRequest {
+            amount: 2500,
+            currency: "gbp".to_string(),
+        };
+
+        assert!(validate_create_payment_intent(&req).is_ok());
     }
 }
