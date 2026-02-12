@@ -1,6 +1,7 @@
 use axum::{
     Json,
     extract::{Path, State},
+    http::HeaderMap,
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
@@ -8,18 +9,28 @@ use uuid::Uuid;
 
 use crate::state::AppState;
 
+const IDEMPOTENCY_ENDPOINT: &str = "POST /v1/payment_intents";
+
 #[derive(Deserialize)]
 pub struct CreatePaymentIntentRequest {
     amount: i64,
     currency: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct PaymentIntentResponse {
     id: Uuid,
     amount: i64,
     currency: String,
     status: String,
+}
+
+fn request_fingerprint(req: &CreatePaymentIntentRequest) -> String {
+    format!(
+        "amount={}&currency={}",
+        req.amount,
+        req.currency.trim().to_lowercase()
+    )
 }
 
 fn validate_create_payment_intent(req: &CreatePaymentIntentRequest) -> Result<(), &'static str> {
@@ -34,38 +45,165 @@ fn validate_create_payment_intent(req: &CreatePaymentIntentRequest) -> Result<()
 
 pub async fn create_payment_intent(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreatePaymentIntentRequest>,
 ) -> Result<(StatusCode, Json<PaymentIntentResponse>), (StatusCode, String)> {
     if let Err(msg) = validate_create_payment_intent(&req) {
         return Err((StatusCode::BAD_REQUEST, msg.to_string()));
     }
 
-    let id = Uuid::new_v4();
-    let status = "requires_confirmation";
+    // Read header
+    let idempotency_key = headers
+        .get("Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
-    sqlx::query!(
-        r#"
+    // If no idempotency key keep current behavior
+    if idempotency_key.is_none() {
+        let id = Uuid::new_v4();
+        let status = "requires_confirmation";
+
+        sqlx::query!(
+            r#"
         INSERT INTO payment_intents (id, amount, currency, status)
         VALUES ($1, $2, $3, $4)
         "#,
-        id,
-        req.amount,
-        req.currency,
-        status
+            id,
+            req.amount,
+            req.currency,
+            status
+        )
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+
+        return Ok((
+            StatusCode::CREATED,
+            Json(PaymentIntentResponse {
+                id,
+                amount: req.amount,
+                currency: req.currency,
+                status: status.to_string(),
+            }),
+        ));
+    }
+
+    // Idempotent path
+    let key = idempotency_key.unwrap();
+    let req_hash = request_fingerprint(&req);
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+
+    // Reserve the key if its new
+    // If already used this returns 0 rows
+    let reserved = sqlx::query!(
+        r#"
+    INSERT INTO idempotency_keys (key, endpoint, request_hash, response_body)
+    VALUES ($1, $2, $3, '{}'::jsonb)
+    ON CONFLICT (key, endpoint) DO NOTHING
+    RETURNING key
+    "#,
+        key,
+        IDEMPOTENCY_ENDPOINT,
+        req_hash
     )
-    .execute(&state.db)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
-    Ok((
-        StatusCode::CREATED,
-        Json(PaymentIntentResponse {
+    if reserved.is_some() {
+        // Successfully reserved the key -> create payment intent
+        let id = Uuid::new_v4();
+        let status = "requires_confirmation";
+
+        sqlx::query!(
+            r#"
+        INSERT INTO payment_intents (id, amount, currency, status)
+        VALUES ($1, $2, $3, $4)
+        "#,
+            id,
+            req.amount,
+            req.currency,
+            status
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+
+        let response = PaymentIntentResponse {
             id,
             amount: req.amount,
             currency: req.currency,
             status: status.to_string(),
-        }),
-    ))
+        };
+
+        // Store the response JSON so retries can return the same thing
+        let response_json = serde_json::to_value(&response).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("json error: {e}"),
+            )
+        })?;
+
+        sqlx::query!(
+            r#"
+        UPDATE idempotency_keys
+        SET response_body = $1
+        WHERE key = $2 AND endpoint = $3
+        "#,
+            response_json,
+            key,
+            IDEMPOTENCY_ENDPOINT
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+
+        return Ok((StatusCode::CREATED, Json(response)));
+    }
+
+    // Key already exists = fetch stored record
+    let row = sqlx::query!(
+        r#"
+    SELECT request_hash, response_body
+    FROM idempotency_keys
+    WHERE key = $1 AND endpoint = $2
+    "#,
+        key,
+        IDEMPOTENCY_ENDPOINT
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+
+    // If request differs its a conflict
+    if row.request_hash != req_hash {
+        tx.rollback().await.ok();
+        return Err((
+            StatusCode::CONFLICT,
+            "idempotency key reused with different request".to_string(),
+        ));
+    }
+
+    // Same request = return stored response
+    let response: PaymentIntentResponse =
+        serde_json::from_value(row.response_body).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("json error: {e}"),
+            )
+        })?;
+
+    tx.commit().await.ok();
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 pub async fn get_payment_intent(
