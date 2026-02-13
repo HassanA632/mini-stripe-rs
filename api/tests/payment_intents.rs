@@ -78,3 +78,86 @@ async fn get_unknown_payment_intent_returns_404(pool: PgPool) {
 
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn idempotency_same_key_same_body_returns_same_intent(pool: PgPool) {
+    let app = build_app(AppState { db: pool });
+
+    let body = json!({ "amount": 2500, "currency": "gbp" }).to_string();
+
+    let res1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/payment_intents")
+                .header("content-type", "application/json")
+                .header("Idempotency-Key", "abc123")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res1.status(), StatusCode::CREATED);
+    let bytes1 = res1.into_body().collect().await.unwrap().to_bytes();
+    let v1: serde_json::Value = serde_json::from_slice(&bytes1).unwrap();
+    let id1 = v1["id"].as_str().unwrap().to_string();
+
+    let res2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/payment_intents")
+                .header("content-type", "application/json")
+                .header("Idempotency-Key", "abc123")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res2.status(), StatusCode::CREATED);
+    let bytes2 = res2.into_body().collect().await.unwrap().to_bytes();
+    let v2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap();
+    let id2 = v2["id"].as_str().unwrap().to_string();
+
+    assert_eq!(id1, id2);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn idempotency_same_key_different_body_returns_409(pool: PgPool) {
+    let app = build_app(AppState { db: pool });
+
+    let body1 = json!({ "amount": 2500, "currency": "gbp" }).to_string();
+    let body2 = json!({ "amount": 9999, "currency": "gbp" }).to_string();
+
+    let res1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/payment_intents")
+                .header("content-type", "application/json")
+                .header("Idempotency-Key", "conflict-key")
+                .body(Body::from(body1))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res1.status(), StatusCode::CREATED);
+
+    let res2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/payment_intents")
+                .header("content-type", "application/json")
+                .header("Idempotency-Key", "conflict-key")
+                .body(Body::from(body2))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res2.status(), StatusCode::CONFLICT);
+}
