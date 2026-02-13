@@ -65,9 +65,9 @@ pub async fn create_payment_intent(
 
         sqlx::query!(
             r#"
-        INSERT INTO payment_intents (id, amount, currency, status)
-        VALUES ($1, $2, $3, $4)
-        "#,
+            INSERT INTO payment_intents (id, amount, currency, status)
+            VALUES ($1, $2, $3, $4)
+            "#,
             id,
             req.amount,
             req.currency,
@@ -102,11 +102,11 @@ pub async fn create_payment_intent(
     // If already used this returns 0 rows
     let reserved = sqlx::query!(
         r#"
-    INSERT INTO idempotency_keys (key, endpoint, request_hash, response_body)
-    VALUES ($1, $2, $3, '{}'::jsonb)
-    ON CONFLICT (key, endpoint) DO NOTHING
-    RETURNING key
-    "#,
+        INSERT INTO idempotency_keys (key, endpoint, request_hash, response_body)
+        VALUES ($1, $2, $3, '{}'::jsonb)
+        ON CONFLICT (key, endpoint) DO NOTHING
+        RETURNING key
+        "#,
         key,
         IDEMPOTENCY_ENDPOINT,
         req_hash
@@ -122,9 +122,9 @@ pub async fn create_payment_intent(
 
         sqlx::query!(
             r#"
-        INSERT INTO payment_intents (id, amount, currency, status)
-        VALUES ($1, $2, $3, $4)
-        "#,
+            INSERT INTO payment_intents (id, amount, currency, status)
+            VALUES ($1, $2, $3, $4)
+            "#,
             id,
             req.amount,
             req.currency,
@@ -149,13 +149,17 @@ pub async fn create_payment_intent(
             )
         })?;
 
+        // Server Crash Edge Case: we store payment_intent_id as well as response_body.
+        // If the server crashes after reserving the idempotency key but before writing
+        // the final response_body: retries can reconstruct the response from payment_intents.
         sqlx::query!(
             r#"
-        UPDATE idempotency_keys
-        SET response_body = $1
-        WHERE key = $2 AND endpoint = $3
-        "#,
+            UPDATE idempotency_keys
+            SET response_body = $1, payment_intent_id = $2
+            WHERE key = $3 AND endpoint = $4
+            "#,
             response_json,
+            id,
             key,
             IDEMPOTENCY_ENDPOINT
         )
@@ -173,7 +177,7 @@ pub async fn create_payment_intent(
     // Key already exists = fetch stored record
     let row = sqlx::query!(
         r#"
-    SELECT request_hash, response_body
+    SELECT request_hash, response_body, payment_intent_id
     FROM idempotency_keys
     WHERE key = $1 AND endpoint = $2
     "#,
@@ -193,17 +197,79 @@ pub async fn create_payment_intent(
         ));
     }
 
-    // Same request = return stored response
-    let response: PaymentIntentResponse =
-        serde_json::from_value(row.response_body).map_err(|e| {
+    // If response_body looks complete return it
+    let looks_complete = row
+        .response_body
+        .get("id")
+        .and_then(|v| v.as_str())
+        .is_some();
+
+    if looks_complete {
+        let response: PaymentIntentResponse =
+            serde_json::from_value(row.response_body).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("json error: {e}"),
+                )
+            })?;
+
+        tx.commit().await.ok();
+        return Ok((StatusCode::CREATED, Json(response)));
+    }
+
+    // Crash fallback: response_body is incomplete: reconstruct using payment_intent_id
+    if let Some(pi_id) = row.payment_intent_id {
+        let pi = sqlx::query!(
+            r#"
+        SELECT id, amount, currency, status
+        FROM payment_intents
+        WHERE id = $1
+        "#,
+            pi_id
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+
+        let response = PaymentIntentResponse {
+            id: pi.id,
+            amount: pi.amount,
+            currency: pi.currency,
+            status: pi.status,
+        };
+
+        // fill response_body so future retries are fast
+        let response_json = serde_json::to_value(&response).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("json error: {e}"),
             )
         })?;
 
-    tx.commit().await.ok();
-    Ok((StatusCode::CREATED, Json(response)))
+        sqlx::query!(
+            r#"
+        UPDATE idempotency_keys
+        SET response_body = $1
+        WHERE key = $2 AND endpoint = $3
+        "#,
+            response_json,
+            key,
+            IDEMPOTENCY_ENDPOINT
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+
+        tx.commit().await.ok();
+        return Ok((StatusCode::CREATED, Json(response)));
+    }
+
+    // Idempotency record exists but is incomplete in a way we cant recover from
+    tx.rollback().await.ok();
+    return Err((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "idempotency record exists but has no stored response or payment_intent_id".to_string(),
+    ));
 }
 
 pub async fn get_payment_intent(
