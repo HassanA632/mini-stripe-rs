@@ -78,3 +78,149 @@ async fn get_unknown_payment_intent_returns_404(pool: PgPool) {
 
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn idempotency_same_key_same_body_returns_same_intent(pool: PgPool) {
+    let app = build_app(AppState { db: pool });
+
+    let body = json!({ "amount": 2500, "currency": "gbp" }).to_string();
+
+    let res1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/payment_intents")
+                .header("content-type", "application/json")
+                .header("Idempotency-Key", "abc123")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res1.status(), StatusCode::CREATED);
+    let bytes1 = res1.into_body().collect().await.unwrap().to_bytes();
+    let v1: serde_json::Value = serde_json::from_slice(&bytes1).unwrap();
+    let id1 = v1["id"].as_str().unwrap().to_string();
+
+    let res2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/payment_intents")
+                .header("content-type", "application/json")
+                .header("Idempotency-Key", "abc123")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res2.status(), StatusCode::CREATED);
+    let bytes2 = res2.into_body().collect().await.unwrap().to_bytes();
+    let v2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap();
+    let id2 = v2["id"].as_str().unwrap().to_string();
+
+    assert_eq!(id1, id2);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn idempotency_same_key_different_body_returns_409(pool: PgPool) {
+    let app = build_app(AppState { db: pool });
+
+    let body1 = json!({ "amount": 2500, "currency": "gbp" }).to_string();
+    let body2 = json!({ "amount": 9999, "currency": "gbp" }).to_string();
+
+    let res1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/payment_intents")
+                .header("content-type", "application/json")
+                .header("Idempotency-Key", "conflict-key")
+                .body(Body::from(body1))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res1.status(), StatusCode::CREATED);
+
+    let res2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/payment_intents")
+                .header("content-type", "application/json")
+                .header("Idempotency-Key", "conflict-key")
+                .body(Body::from(body2))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res2.status(), StatusCode::CONFLICT);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn idempotency_reconstructs_response_if_response_body_missing(pool: PgPool) {
+    let app = build_app(AppState { db: pool.clone() });
+
+    let pi_id = Uuid::new_v4();
+    sqlx::query!(
+        r#"
+        INSERT INTO payment_intents (id, amount, currency, status)
+        VALUES ($1, $2, $3, $4)
+        "#,
+        pi_id,
+        2500_i64,
+        "gbp",
+        "requires_confirmation"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert idempotency row that looks like "reserved" but response_body not written
+    let req_hash = "amount=2500&currency=gbp";
+
+    sqlx::query!(
+        r#"
+        INSERT INTO idempotency_keys (key, endpoint, request_hash, response_body, payment_intent_id)
+        VALUES ($1, $2, $3, '{}'::jsonb, $4)
+        "#,
+        "crash-window-key",
+        "POST /v1/payment_intents",
+        req_hash,
+        pi_id
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Call the API as if retrying the same request
+    let body = json!({ "amount": 2500, "currency": "gbp" }).to_string();
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/payment_intents")
+                .header("content-type", "application/json")
+                .header("Idempotency-Key", "crash-window-key")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(v["id"].as_str().unwrap(), pi_id.to_string());
+    assert_eq!(v["amount"], 2500);
+    assert_eq!(v["currency"], "gbp");
+    assert_eq!(v["status"], "requires_confirmation");
+}
