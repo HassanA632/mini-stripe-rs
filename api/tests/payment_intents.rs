@@ -161,3 +161,66 @@ async fn idempotency_same_key_different_body_returns_409(pool: PgPool) {
         .unwrap();
     assert_eq!(res2.status(), StatusCode::CONFLICT);
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn idempotency_reconstructs_response_if_response_body_missing(pool: PgPool) {
+    let app = build_app(AppState { db: pool.clone() });
+
+    let pi_id = Uuid::new_v4();
+    sqlx::query!(
+        r#"
+        INSERT INTO payment_intents (id, amount, currency, status)
+        VALUES ($1, $2, $3, $4)
+        "#,
+        pi_id,
+        2500_i64,
+        "gbp",
+        "requires_confirmation"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert idempotency row that looks like "reserved" but response_body not written
+    let req_hash = "amount=2500&currency=gbp";
+
+    sqlx::query!(
+        r#"
+        INSERT INTO idempotency_keys (key, endpoint, request_hash, response_body, payment_intent_id)
+        VALUES ($1, $2, $3, '{}'::jsonb, $4)
+        "#,
+        "crash-window-key",
+        "POST /v1/payment_intents",
+        req_hash,
+        pi_id
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Call the API as if retrying the same request
+    let body = json!({ "amount": 2500, "currency": "gbp" }).to_string();
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/payment_intents")
+                .header("content-type", "application/json")
+                .header("Idempotency-Key", "crash-window-key")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(v["id"].as_str().unwrap(), pi_id.to_string());
+    assert_eq!(v["amount"], 2500);
+    assert_eq!(v["currency"], "gbp");
+    assert_eq!(v["status"], "requires_confirmation");
+}
