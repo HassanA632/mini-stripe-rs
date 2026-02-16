@@ -302,6 +302,55 @@ pub async fn get_payment_intent(
     }
 }
 
+pub async fn confirm_payment_intent(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<PaymentIntentResponse>, (StatusCode, String)> {
+    // Try to update only if in the correct state
+    let updated = sqlx::query!(
+        r#"
+        UPDATE payment_intents
+        SET status = 'succeeded'
+        WHERE id = $1 AND status = 'requires_confirmation'
+        RETURNING id, amount, currency, status
+        "#,
+        id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+
+    if let Some(pi) = updated {
+        return Ok(Json(PaymentIntentResponse {
+            id: pi.id,
+            amount: pi.amount,
+            currency: pi.currency,
+            status: pi.status,
+        }));
+    }
+
+    // Not updated = not found/invalid state
+    let exists = sqlx::query!(
+        r#"
+        SELECT status
+        FROM payment_intents
+        WHERE id = $1
+        "#,
+        id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+
+    match exists {
+        None => Err((StatusCode::NOT_FOUND, "paymnt_intent not found".to_string())),
+        Some(row) => Err((
+            StatusCode::CONFLICT,
+            format!("cannot confirm payment_intent in status '{}'", row.status),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
