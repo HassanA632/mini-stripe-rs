@@ -20,5 +20,10 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/payment_intents/{id}",
             get(payment_intents::get_payment_intent),
         )
-        .with_state(state)
+        .with_state(state.clone())
+        .route(
+            "/v1/payment_intents/{id}/confirm",
+            post(payment_intents::confirm_payment_intent),
+        )
+        .with_state(state.clone())
 }

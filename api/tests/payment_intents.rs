@@ -224,3 +224,135 @@ async fn idempotency_reconstructs_response_if_response_body_missing(pool: PgPool
     assert_eq!(v["currency"], "gbp");
     assert_eq!(v["status"], "requires_confirmation");
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_then_confirm_payment_intent_sets_succeeded(pool: PgPool) {
+    let app = build_app(AppState { db: pool });
+
+    let body = json!({ "amount": 1000, "currency": "gbp" }).to_string();
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/payment_intents")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/payment_intents/{id}/confirm"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let confirmed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(confirmed["id"], created["id"]);
+    assert_eq!(confirmed["status"], "succeeded");
+
+    // Get again to ensure DB updated
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/v1/payment_intents/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let fetched: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(fetched["status"], "succeeded");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn confirming_twice_returns_409(pool: PgPool) {
+    let app = build_app(AppState { db: pool });
+
+    let body = json!({ "amount": 1500, "currency": "gbp" }).to_string();
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/payment_intents")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/payment_intents/{id}/confirm"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Second confirm should conflict
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/payment_intents/{id}/confirm"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn confirm_unknown_payment_intent_returns_404(pool: PgPool) {
+    let app = build_app(AppState { db: pool });
+
+    let random_id = Uuid::new_v4();
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/payment_intents/{random_id}/confirm"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
