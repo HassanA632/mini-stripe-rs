@@ -4,9 +4,11 @@ use axum::{
     http::HeaderMap,
     http::StatusCode,
 };
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::events_outbox::insert_event;
 use crate::state::AppState;
 
 const IDEMPOTENCY_ENDPOINT: &str = "POST /v1/payment_intents";
@@ -167,6 +169,20 @@ pub async fn create_payment_intent(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
+        // Outbox event to record that a new payment intent was created
+        let payload = serde_json::json!({
+            "payment_intent": {
+                "id": response.id,
+                "amount": response.amount,
+                "currency": response.currency.clone(),
+                "status": response.status.clone()
+            }
+        });
+
+        insert_event(&mut *tx, "payment_intent.created", payload)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+
         tx.commit()
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
@@ -306,6 +322,12 @@ pub async fn confirm_payment_intent(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PaymentIntentResponse>, (StatusCode, String)> {
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+
     // Try to update only if in the correct state
     let updated = sqlx::query!(
         r#"
@@ -316,17 +338,37 @@ pub async fn confirm_payment_intent(
         "#,
         id
     )
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
     if let Some(pi) = updated {
-        return Ok(Json(PaymentIntentResponse {
+        let response = PaymentIntentResponse {
             id: pi.id,
             amount: pi.amount,
             currency: pi.currency,
             status: pi.status,
-        }));
+        };
+
+        // Outbox event records successful confirmation
+        let payload = serde_json::json!({
+            "payment_intent": {
+                "id": response.id,
+                "amount": response.amount,
+                "currency": response.currency.clone(),
+                "status": response.status.clone()
+            }
+        });
+
+        insert_event(&mut *tx, "payment_intent.succeeded", payload)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+
+        return Ok(Json(response));
     }
 
     // Not updated = not found/invalid state
@@ -338,12 +380,18 @@ pub async fn confirm_payment_intent(
         "#,
         id
     )
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
+    // No state change happened safe to rollback
+    tx.rollback().await.ok();
+
     match exists {
-        None => Err((StatusCode::NOT_FOUND, "paymnt_intent not found".to_string())),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            "payment_intent not found".to_string(),
+        )),
         Some(row) => Err((
             StatusCode::CONFLICT,
             format!("cannot confirm payment_intent in status '{}'", row.status),
