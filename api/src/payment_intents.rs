@@ -65,6 +65,11 @@ pub async fn create_payment_intent(
         let id = Uuid::new_v4();
         let status = "requires_confirmation";
 
+        let mut tx = state
+            .db
+            .begin()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
         sqlx::query!(
             r#"
             INSERT INTO payment_intents (id, amount, currency, status)
@@ -75,19 +80,35 @@ pub async fn create_payment_intent(
             req.currency,
             status
         )
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
 
-        return Ok((
-            StatusCode::CREATED,
-            Json(PaymentIntentResponse {
-                id,
-                amount: req.amount,
-                currency: req.currency,
-                status: status.to_string(),
-            }),
-        ));
+        let response = PaymentIntentResponse {
+            id,
+            amount: req.amount,
+            currency: req.currency,
+            status: status.to_string(),
+        };
+
+        let payload = serde_json::json!({
+            "payment_intent": {
+                "id": response.id,
+                "amount": response.amount,
+                "currency": response.currency.clone(),
+                "status": response.status.clone()
+            }
+        });
+
+        insert_event(&mut *tx, "payment_intent.created", payload)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?;
+
+        return Ok((StatusCode::CREATED, Json(response)));
     }
 
     // Idempotent path

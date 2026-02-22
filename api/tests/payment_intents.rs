@@ -356,3 +356,119 @@ async fn confirm_unknown_payment_intent_returns_404(pool: PgPool) {
 
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn create_payment_intent_writes_created_outbox_event(pool: PgPool) {
+    let app = build_app(AppState { db: pool.clone() });
+
+    // Create payment intent via API
+    let body = json!({ "amount": 2000, "currency": "gbp" }).to_string();
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/payment_intents")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let pi_id = created["id"].as_str().unwrap();
+
+    // Assert outbox event written
+    let row = sqlx::query!(
+        r#"
+        SELECT event_type, payload
+        FROM events_outbox
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(row.event_type, "payment_intent.created");
+    assert_eq!(row.payload["payment_intent"]["id"].as_str().unwrap(), pi_id);
+    assert_eq!(row.payload["payment_intent"]["amount"], 2000);
+    assert_eq!(row.payload["payment_intent"]["currency"], "gbp");
+    assert_eq!(
+        row.payload["payment_intent"]["status"].as_str().unwrap(),
+        "requires_confirmation"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn confirm_payment_intent_writes_succeeded_outbox_event(pool: PgPool) {
+    let app = build_app(AppState { db: pool.clone() });
+
+    // Create via API
+    let body = json!({ "amount": 3000, "currency": "gbp" }).to_string();
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/payment_intents")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let pi_id = created["id"].as_str().unwrap().to_string();
+
+    // Confirm via API
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/payment_intents/{pi_id}/confirm"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Assert a succeeded event exists for this payment intent
+    let rows = sqlx::query!(
+        r#"
+        SELECT event_type, payload
+        FROM events_outbox
+        ORDER BY created_at ASC
+        "#
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    let succeeded_event = rows.iter().find(|row| {
+        row.event_type == "payment_intent.succeeded"
+            && row.payload["payment_intent"]["id"].as_str() == Some(pi_id.as_str())
+    });
+
+    let event = succeeded_event.expect("expected payment_intent.succeeded outbox event");
+
+    assert_eq!(event.event_type, "payment_intent.succeeded");
+    assert_eq!(event.payload["payment_intent"]["amount"], 3000);
+    assert_eq!(event.payload["payment_intent"]["currency"], "gbp");
+    assert_eq!(
+        event.payload["payment_intent"]["status"].as_str().unwrap(),
+        "succeeded"
+    );
+}
