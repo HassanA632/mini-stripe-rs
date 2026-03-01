@@ -3,7 +3,7 @@ use axum::{
     routing::{get, post},
 };
 
-use crate::{payment_intents, state::AppState};
+use crate::{payment_intents, state::AppState, webhook_endpoints};
 
 async fn health() -> &'static str {
     "ok"
@@ -24,6 +24,16 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/v1/payment_intents/{id}/confirm",
             post(payment_intents::confirm_payment_intent),
+        )
+        .with_state(state.clone())
+        .route(
+            "/v1/webhook_endpoints",
+            post(webhook_endpoints::create_webhook_endpoint),
+        )
+        .with_state(state.clone())
+        .route(
+            "/v1/webhook_endpoints",
+            get(webhook_endpoints::list_webhook_endpoints),
         )
         .with_state(state.clone())
 }
