@@ -138,6 +138,27 @@ pub async fn mark_delivery_failed(
     attempt_count: i32,
     error: String,
 ) -> Result<(), sqlx::Error> {
+    const MAX_ATTEMPTS: i32 = 10;
+
+    if attempt_count >= MAX_ATTEMPTS {
+        sqlx::query!(
+            r#"
+            UPDATE webhook_deliveries
+            SET status = 'failed',
+                next_attempt_at = NULL,
+                last_error = $2,
+                updated_at = now()
+            WHERE id = $1
+            "#,
+            delivery_id,
+            error
+        )
+        .execute(db)
+        .await?;
+
+        return Ok(());
+    }
+
     // Simple exponential backoff with cap
     let delay_secs = (2_i64.pow(attempt_count.min(10) as u32)).min(60);
 

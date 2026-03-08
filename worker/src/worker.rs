@@ -6,6 +6,8 @@ use tracing::{info, warn};
 
 use crate::{db, deliver};
 
+const MAX_ATTEMPTS: i32 = 10;
+
 pub async fn run(db_pool: PgPool) {
     info!("worker started");
 
