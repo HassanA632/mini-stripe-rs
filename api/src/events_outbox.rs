@@ -9,7 +9,7 @@ pub async fn insert_event(
     let event_id = Uuid::new_v4();
 
     sqlx::query!(
-        r#"
+        r#" 
         INSERT INTO events_outbox (id, event_type, payload)
         VALUES ($1, $2, $3)
         "#,
