@@ -57,6 +57,9 @@ async fn poll_once(db_pool: &PgPool, client: &Client) -> Result<(), String> {
             db::mark_delivery_succeeded(db_pool, job.delivery_id)
                 .await
                 .map_err(|e| e.to_string())?;
+            db::maybe_mark_event_delivered(db_pool, job.event_id)
+                .await
+                .map_err(|e| e.to_string())?;
             info!(
                 "delivered event {} to endpoint {} (HTTP {})",
                 job.event_id, job.endpoint_id, code
@@ -71,6 +74,9 @@ async fn poll_once(db_pool: &PgPool, client: &Client) -> Result<(), String> {
             )
             .await
             .map_err(|e| e.to_string())?;
+            db::maybe_mark_event_delivered(db_pool, job.event_id)
+                .await
+                .map_err(|e| e.to_string())?;
             warn!(
                 "delivery failed event {} to endpoint {} (HTTP {})",
                 job.event_id, job.endpoint_id, code
@@ -80,6 +86,10 @@ async fn poll_once(db_pool: &PgPool, client: &Client) -> Result<(), String> {
             db::mark_delivery_failed(db_pool, job.delivery_id, job.attempt_count, err.clone())
                 .await
                 .map_err(|e| e.to_string())?;
+            db::maybe_mark_event_delivered(db_pool, job.event_id)
+                .await
+                .map_err(|e| e.to_string())?;
+
             warn!(
                 "delivery failed event {} to endpoint {} ({})",
                 job.event_id, job.endpoint_id, err

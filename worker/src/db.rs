@@ -180,3 +180,34 @@ pub async fn mark_delivery_failed(
 
     Ok(())
 }
+
+pub async fn maybe_mark_event_delivered(db: &PgPool, event_id: Uuid) -> Result<(), sqlx::Error> {
+    // If there are any deliveries still pending for this event its not done
+    let remaining: i64 = sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(*)::bigint AS "count!"
+        FROM webhook_deliveries
+        WHERE event_id = $1
+          AND status IN ('pending', 'in_progress')
+        "#,
+        event_id
+    )
+    .fetch_one(db)
+    .await?;
+
+    if remaining == 0 {
+        // Mark delivered_at once (idempotent).
+        sqlx::query!(
+            r#"
+            UPDATE events_outbox
+            SET delivered_at = COALESCE(delivered_at, now())
+            WHERE id = $1
+            "#,
+            event_id
+        )
+        .execute(db)
+        .await?;
+    }
+
+    Ok(())
+}
